@@ -580,7 +580,129 @@ async function rhythm(x,onProgress,changes){
   return {bpm:Math.round(600/period)/10,beats:beats.map(function(t){return Math.round(t*1000)/1000;}),sub:sub,meter:mt.meter,down:mt.down};
 }
 
-var api={decode:decode,features:features,detect:detect,align:align,rhythm:rhythm,meterFrom:meterFrom,_resample:resample,SR:SR};
+/* ---------- beat-synchronous chords ---------- */
+// The song is cut into beat subdivisions ("units"). Chords may change only at a unit start;
+// changing on a bar start is cheap, on the middle of the bar costs more, on other beats more,
+// and between beats a lot.
+var KU=5, PEN_BAR=1.5, PEN_HALF=5, PEN_BEAT=9, PEN_OFF=15, PEN_FLAT=5;
+function grid(F,R,flat){
+  var B=R.beats.slice(), i, k, u, f;
+  if(B.length<4) return null;
+  var iv=[]; for(i=1;i<B.length;i++) iv.push(B[i]-B[i-1]); iv.sort(function(a,b){return a-b;});
+  var p=iv[iv.length>>1], pre=0;
+  while(B[0]-p>-0.3*p){ B.unshift(B[0]-p); pre++; }
+  while(B[B.length-1]<F.dur){ B.push(B[B.length-1]+p); }
+  var m=R.meter, down=((R.down+pre)%m+m)%m, ns=R.sub||2, U=[];
+  for(i=0;i<B.length-1;i++) for(k=0;k<ns;k++) U.push([B[i]+(B[i+1]-B[i])*k/ns,B[i]+(B[i+1]-B[i])*(k+1)/ns,i,k]);
+  var n=U.length, C=new Float32Array(n*12), Bc=new Float32Array(n*12), sil=new Uint8Array(n), t=new Float64Array(n), pen=new Float32Array(n), bar=new Int32Array(n);
+  for(u=0;u<n;u++){
+    var a=U[u][0], b=U[u][1], f0=Math.ceil((a-F.t0)/F.hop), f1=Math.floor((b-F.t0)/F.hop-1e-9);
+    if(f1<f0){ f0=f1=Math.round(((a+b)/2-F.t0)/F.hop); }
+    f0=Math.max(0,Math.min(F.N-1,f0)); f1=Math.max(0,Math.min(F.N-1,f1));
+    var cnt=0, s=0, o=u*12;
+    for(f=f0;f<=f1;f++){ for(i=0;i<12;i++){ C[o+i]+=F.C[f*12+i]; Bc[o+i]+=F.B[f*12+i]; } s+=F.silent[f]; cnt++; }
+    zn(C,o); zn(Bc,o);
+    sil[u]=s*2>cnt?1:0;
+    t[u]=Math.max(0,a);
+    var pos=((U[u][2]-down)%m+m)%m;
+    bar[u]=Math.floor((U[u][2]-down)/m);
+    pen[u]=U[u][3]>0?PEN_OFF:(flat?PEN_FLAT:(pos===0?PEN_BAR:((m===4&&pos===2)||(m===2&&pos===1)?PEN_HALF:PEN_BEAT)));
+  }
+  return {N:n,C:C,B:Bc,silent:sil,t:t,pen:pen,ns:ns,beat:p};
+}
+function zn(X,o){
+  var mu=0, sd=0, i;
+  for(i=0;i<12;i++) mu+=X[o+i]; mu/=12;
+  for(i=0;i<12;i++){ var z=X[o+i]-mu; sd+=z*z; }
+  sd=Math.sqrt(sd/12);
+  for(i=0;i<12;i++) X[o+i]=sd>1e-6?(X[o+i]-mu)/sd:0;
+}
+function detectGrid(G){
+  var N=G.N, S=25, T=[], i, u, s;
+  for(i=0;i<12;i++) T.push(template(i,'maj'));
+  for(i=0;i<12;i++) T.push(template(i,'m'));
+  function em(u,s){ if(s===24) return G.silent[u]?KU*0.9:KU*0.05; return G.silent[u]?-KU:KU*match(G,u,T[s],s%12); }
+  var score=new Float64Array(S), next=new Float64Array(S), bp=new Uint8Array(N*S);
+  for(s=0;s<S;s++){ score[s]=em(0,s); bp[s]=s; }
+  for(u=1;u<N;u++){
+    var b1=-1e18,i1=0,b2=-1e18;
+    for(s=0;s<S;s++){ if(score[s]>b1){b2=b1;b1=score[s];i1=s;} else if(score[s]>b2) b2=score[s]; }
+    var pen=G.pen[u];
+    for(s=0;s<S;s++){
+      var other=(s===i1?b2:b1)-pen, src=(s===i1?-1:i1);
+      if(src<0){ var bb=-1e18; for(var q=0;q<S;q++) if(q!==s&&score[q]>bb){bb=score[q];src=q;} }
+      if(score[s]>=other){ next[s]=score[s]; bp[u*S+s]=s; } else { next[s]=other; bp[u*S+s]=src; }
+      next[s]+=em(u,s);
+    }
+    var tmp=score; score=next; next=tmp;
+  }
+  var last=0; for(s=1;s<S;s++) if(score[s]>score[last]) last=s;
+  var path=new Uint8Array(N); path[N-1]=last;
+  for(u=N-1;u>0;u--) path[u-1]=bp[u*S+path[u]];
+  var out=[];
+  for(u=0;u<N;u++){ if(u===0||path[u]!==path[u-1]) out.push({u:u,s:path[u]}); }
+  // a lone off-beat sliver: give it to its neighbours
+  out=out.filter(function(x,j){ var nx=out[j+1], len=(nx?nx.u:N)-x.u; return !(len<G.ns&&j>0&&G.pen[x.u]>=PEN_OFF); });
+  var merged=[]; out.forEach(function(x){ if(!merged.length||merged[merged.length-1].s!==x.s) merged.push(x); });
+  return merged.filter(function(x){return x.s!==24;}).map(function(x){ return {t:G.t[x.u],pc:x.s%12,minor:x.s>=12}; });
+}
+// seq: [{pc,base}], st: [{line:firstIndexOfLine, lineEnd:bool, sec:firstIndexOfSection, secEnd:bool}]
+var SKIPU=10, REPU=5;
+function alignGridShift(G,seq,st,shift){
+  var M=seq.length, N=G.N, S=M+2, i, u, s;
+  var T=seq.map(function(c){ return template((c.pc+shift)%12,c.base); }), Rt=seq.map(function(c){ return (c.pc+shift)%12; });
+  var E=new Float32Array(N*M);
+  for(u=0;u<N;u++) for(i=0;i<M;i++) E[u*M+i]=G.silent[u]?-KU*0.5:KU*match(G,u,T[i],Rt[i]);
+  function em(u,s){ if(s===0||s===S-1) return G.silent[u]?KU*0.9:KU*0.12; return E[u*M+s-1]; }
+  // repeat edges: state of a line/section end -> state of its first chord
+  var rep=[]; for(s=0;s<S;s++) rep.push([]);
+  st.forEach(function(x,i){
+    if(x.lineEnd&&x.line<i) rep[x.line+1].push(i+1);
+    if(x.secEnd&&x.sec<i&&x.sec!==x.line) rep[x.sec+1].push(i+1);
+  });
+  var NEG=-1e18, score=new Float64Array(S), next=new Float64Array(S), bp=new Int32Array(N*S);
+  for(s=0;s<S;s++) score[s]=NEG;
+  score[0]=em(0,0); score[1]=em(0,1); bp[0]=0; bp[1]=1;
+  for(u=1;u<N;u++){
+    var pen=G.pen[u];
+    for(s=0;s<S;s++){
+      var b=score[s], k=s, v;
+      if(s>=1&&(v=score[s-1]-pen)>b){b=v;k=s-1;}
+      if(s>=2&&s<=M&&(v=score[s-2]-pen-SKIPU)>b){b=v;k=s-2;}
+      var rs=rep[s]; for(var r=0;r<rs.length;r++){ if((v=score[rs[r]]-pen-REPU)>b){b=v;k=rs[r];} }
+      next[s]=b===NEG?NEG:b+em(u,s); bp[u*S+s]=k;
+    }
+    var tmp=score; score=next; next=tmp;
+  }
+  var end=score[S-1]>score[M]?S-1:M, total=score[end];
+  var path=new Int32Array(N); path[N-1]=end;
+  for(u=N-1;u>0;u--) path[u-1]=bp[u*S+path[u]];
+  var occ=[];
+  for(u=0;u<N;u++){ s=path[u]; if(s>=1&&s<=M&&(u===0||path[u-1]!==s)) occ.push({g:s-1,t:Math.round(G.t[u]*1000)/1000}); }
+  return {occ:occ,score:total/N,shift:shift};
+}
+function alignGrid(G,seq,st){
+  if(!seq.length) return null;
+  var best=null;
+  for(var sh=0;sh<12;sh++){ var r=alignGridShift(G,seq,st,sh); if(!best||r.score>best.score) best=r; }
+  var times=new Array(seq.length); for(var i=0;i<seq.length;i++) times[i]=null;
+  best.occ.forEach(function(o){ if(times[o.g]===null) times[o.g]=o.t; });
+  best.times=times;
+  return best;
+}
+
+// two passes: first without a bar prior to find where chords really change, use that to
+// place the bar lines, then decode again with the bar prior
+function chordsOnBeats(F,R,seq,st){
+  var G0=grid(F,R,true); if(!G0) return null;
+  var first=seq?alignGrid(G0,seq,st):null;
+  var ch=seq?first.occ.map(function(o){return o.t;}):detectGrid(G0).map(function(d){return d.t;});
+  var mt=meterFrom(R.beats,ch,R.sub); R.meter=mt.meter; R.down=mt.down;
+  var G=grid(F,R,false);
+  if(seq) return {kind:'align',res:alignGrid(G,seq,st),R:R};
+  return {kind:'detect',res:detectGrid(G),R:R};
+}
+var api={chordsOnBeats:chordsOnBeats,decode:decode,features:features,detect:detect,align:align,rhythm:rhythm,meterFrom:meterFrom,grid:grid,detectGrid:detectGrid,alignGrid:alignGrid,_resample:resample,SR:SR};
 if(typeof module!=='undefined'&&module.exports) module.exports=api; else root.ChordEngine=api;
 })(typeof window!=='undefined'?window:globalThis);
 
@@ -949,8 +1071,23 @@ function paintMain(){
 /* ---- play view ---- */
 var PPS=58; // timeline pixels per second
 var PL={ev:[],k:-2,lineShown:-1};
+function sheetStruct(p){
+  var sec=0, lineSec=[], F=p.F, st=[], i;
+  p.lines.forEach(function(l,li){ if(l.t==='sec'||l.t==='blank') sec++; lineSec[li]=sec; });
+  for(i=0;i<F.length;i++){
+    var ls=i; while(ls>0&&F[ls-1].li===F[i].li) ls--;
+    var ss=i; while(ss>0&&lineSec[F[ss-1].li]===lineSec[F[i].li]) ss--;
+    st.push({line:ls,lineEnd:i+1===F.length||F[i+1].li!==F[i].li,sec:ss,secEnd:i+1===F.length||lineSec[F[i+1].li]!==lineSec[F[i].li]});
+  }
+  return st;
+}
 function events(s){
   var F=P(s).F, times=(s.sync&&s.sync.times)||[], ev=[];
+  if(s.sync&&s.sync.ev){
+    s.sync.ev.forEach(function(o,k){ var f=F[o.g]; if(f&&o.t!=null&&isFinite(o.t)) ev.push({c:f.c,li:f.li,g:f.g,t:o.t,o:k}); });
+    ev.sort(function(a,b){return a.t-b.t;});
+    return ev;
+  }
   F.forEach(function(f,i){ var t=times[i]; if(t!=null&&isFinite(t)) ev.push({c:f.c,li:f.li,g:f.g,t:t}); });
   ev.sort(function(a,b){return a.t-b.t;});
   return ev;
@@ -1158,7 +1295,8 @@ function paintFix(){
   var e=PL.ev[S.sel];
   if(!e){ box.innerHTML=''; return; }
   var sh=shiftOf(s), name=tr(e.c,sh), h='<div class="fix"><div class="fixh"><b><bdi>'+esc(name)+'</bdi></b><span>מתחיל ב-'+fmt1(e.t)+'</span><button class="pill" data-act="fix-x">סגור</button></div><div class="fixr">';
-  h+='<button class="btn" data-act="fix-m">מוקדם יותר</button><button class="btn" data-act="fix-p">מאוחר יותר</button>';
+  var byBeat=s.rhythm&&s.rhythm.beats&&s.rhythm.beats.length>3;
+  h+='<button class="btn" data-act="fix-m">'+(byBeat?'פעמה אחת מוקדם':'מוקדם יותר')+'</button><button class="btn" data-act="fix-p">'+(byBeat?'פעמה אחת מאוחר':'מאוחר יותר')+'</button>';
   h+='<button class="btn" data-act="fix-go">נגן מכאן</button><button class="btn dng" data-act="fix-del">מחק אקורד</button>';
   if(s.auto){
     var opts=CHOICES.indexOf(name)<0?[name].concat(CHOICES):CHOICES;
@@ -1505,12 +1643,16 @@ function act(a,el){
     case 'sel': if(S.tab==='play'){ var j=+el.getAttribute('data-j'); S.sel=S.sel===j?-1:j; for(var q=0;q<PL.ev.length;q++){ var bq=document.getElementById('b'+q); if(bq) bq.classList.toggle('sel',q===S.sel); } paintFix(); } break;
     case 'fix-x': S.sel=-1; buildTimeline(); break;
     case 'fix-m': case 'fix-p':
-      fixApply(function(s,e){ var j=S.sel, d=a==='fix-p'?0.1:-0.1, lo=j>0?PL.ev[j-1].t+0.05:0, hi=j+1<PL.ev.length?PL.ev[j+1].t-0.05:1e9;
-        s.sync.times[e.g]=Math.round(Math.max(lo,Math.min(hi,e.t+d))*1000)/1000; }); break;
+      fixApply(function(s,e){ var j=S.sel, dir=a==='fix-p'?1:-1, lo=j>0?PL.ev[j-1].t+0.05:0, hi=j+1<PL.ev.length?PL.ev[j+1].t-0.05:1e9, nt=e.t+0.1*dir;
+        var B=s.rhythm&&s.rhythm.beats;
+        if(B&&B.length>3){ var bi=0, bd=1e9; B.forEach(function(b,i){ var dd=Math.abs(b-e.t); if(dd<bd){bd=dd;bi=i;} }); var tgt=B[bi+dir]; if(tgt!=null) nt=tgt; }
+        nt=Math.round(Math.max(lo,Math.min(hi,nt))*1000)/1000;
+        if(e.o!=null&&s.sync.ev) s.sync.ev[e.o].t=nt; else s.sync.times[e.g]=nt; }); break;
     case 'fix-go': (function(){ var e=PL.ev[S.sel]; if(e&&ytp&&ytReady){ ytp.seekTo(Math.max(0,e.t+(cur().offset||0)-1.5),true); CLK.raw=-1; ytp.playVideo(); } })(); break;
     case 'fix-del':
       fixApply(function(s,e){
         if(s.auto){ var names=P(s).F.map(function(f){return f.c.src;}); names.splice(e.g,1); s.sync.times.splice(e.g,1); s.raw=autoRaw(names); s.sync.n=names.length; delete pcache[s.id]; }
+        else if(e.o!=null&&s.sync.ev) s.sync.ev.splice(e.o,1);
         else s.sync.times[e.g]=null;
       });
       S.sel=-1; buildTimeline(); break;
@@ -1602,31 +1744,37 @@ function runAnalysis(){
     return ChordEngine.features(x,function(p){ if(run===anlRun) anlSet(null,0.1+0.65*p); });
   }).then(function(F){
     if(!F||run!==anlRun||S.id!==s.id) return;
-    anlSet('מסדר את האקורדים בזמן…',0.78);
-    return later(30).then(function(){
-      var pp=P(s), note='';
-      if(pp.F.length&&!s.auto){
-        var seq=pp.F.map(function(f){ return {pc:f.c.pc,base:baseOf(f.c.q)}; });
-        var al=ChordEngine.align(F,seq);
-        s.sync={vid:mediaKey(s),times:al.times,n:seq.length,auto:true};
-        var d=al.shift>6?al.shift-12:al.shift;
-        if(d!==0){
-          s.t=d; var sg=suggest(pp.F,s.t); s.capo=sg?sg.capo:0;
-          note='ההקלטה נשמעת '+Math.abs(d)+' חצאי טון '+(d>0?'גבוה':'נמוך')+' מהאקורדים שהדבקת, אז התאמתי את הטון'+(s.capo?' ובחרתי קאפו '+s.capo+' כדי שיהיה קל לנגן':'')+'.';
-        } else note='מצאתי מתי מחליפים כל אקורד. אם משהו לא במקום, לחץ עליו ברצועה כדי לתקן.';
-      } else {
-        var det=ChordEngine.detect(F);
-        if(!det.length) throw {msg:'לא זיהיתי אקורדים בשיר הזה.'};
-        var names=det.map(function(x){ return chordName(x.pc,x.minor); });
-        s.raw=autoRaw(names); s.auto=true; s.t=0;
-        delete pcache[s.id];
-        s.sync={vid:mediaKey(s),times:det.map(function(x){return x.t;}),n:names.length,auto:true};
-        var sg2=suggest(P(s).F,0); s.capo=sg2?sg2.capo:0;
-        note='זיהיתי '+names.length+' החלפות אקורד'+(s.capo?', ובחרתי קאפו '+s.capo+' כדי שיהיה קל לנגן':'')+'. אם אקורד לא נשמע נכון, לחץ עליו ברצועה כדי להחליף אותו.';
-      }
-      anlSet('מזהה את הקצב…',0.82);
-      return ChordEngine.rhythm(X,function(p){ if(run===anlRun) anlSet(null,0.82+0.16*p); },s.sync.times).then(function(r){
-        if(r){ r.src='auto'; r.pat=null; s.rhythm=r; }
+    anlSet('מוצא את הפעמות…',0.76);
+    return ChordEngine.rhythm(X,function(p){ if(run===anlRun) anlSet(null,0.76+0.14*p); },null).then(function(R){
+      if(run!==anlRun||S.id!==s.id) return;
+      anlSet('מסדר את האקורדים על הפעמות…',0.92);
+      return later(30).then(function(){
+        var pp=P(s), note='', useSheet=pp.F.length&&!s.auto, res=null;
+        var seq=useSheet?pp.F.map(function(f){ return {pc:f.c.pc,base:baseOf(f.c.q)}; }):null;
+        if(R) res=ChordEngine.chordsOnBeats(F,R,seq,useSheet?sheetStruct(pp):null);
+        if(useSheet){
+          var al=res?res.res:ChordEngine.align(F,seq);
+          s.sync={vid:mediaKey(s),times:al.times,n:seq.length,auto:true};
+          if(al.occ) s.sync.ev=al.occ;
+          var reps=al.occ?al.occ.length-new Set(al.occ.map(function(o){return o.g;})).size:0;
+          var d=al.shift>6?al.shift-12:al.shift;
+          if(d!==0){
+            s.t=d;
+            if(d>0&&d<=7){ s.capo=d; note='ההקלטה נשמעת '+d+' חצאי טון גבוה מהאקורדים שהדבקת. שים קאפו '+d+' ונגן את האקורדים בדיוק כמו בדף.'; }
+            else { var sg=suggest(pp.F,s.t); s.capo=sg?sg.capo:0; note='ההקלטה נשמעת '+Math.abs(d)+' חצאי טון נמוך מהאקורדים שהדבקת, אז התאמתי את הטון'+(s.capo?' ובחרתי קאפו '+s.capo+' כדי שיהיה קל לנגן':'')+'.'; }
+          } else note='מצאתי מתי מחליפים כל אקורד, לפי הפעמות של השיר.';
+          if(reps>0) note+=' זיהיתי גם חלקים שחוזרים בשיר בלי שנכתבו בדף, וסידרתי אותם.';
+        } else {
+          var det=res?res.res:ChordEngine.detect(F);
+          if(!det.length) throw {msg:'לא זיהיתי אקורדים בשיר הזה.'};
+          var names=det.map(function(x){ return chordName(x.pc,x.minor); });
+          s.raw=autoRaw(names); s.auto=true; s.t=0;
+          delete pcache[s.id];
+          s.sync={vid:mediaKey(s),times:det.map(function(x){return x.t;}),n:names.length,auto:true};
+          var sg2=suggest(P(s).F,0); s.capo=sg2?sg2.capo:0;
+          note='זיהיתי '+names.length+' החלפות אקורד לפי הפעמות של השיר'+(s.capo?', ובחרתי קאפו '+s.capo+' כדי שיהיה קל לנגן':'')+'. אם אקורד לא נשמע נכון, לחץ עליו ברצועה כדי להחליף אותו.';
+        }
+        if(R){ var RR=res?res.R:R; RR.src='auto'; RR.pat=(s.rhythm&&s.rhythm.src==='auto')?s.rhythm.pat:null; s.rhythm=RR; }
         X=null;
         s.analyzedIn=Math.round((performance.now()-t0)/1000);
         touch(s); ANL=null; S.notice=note; S.tab='play'; paintOpts(); paintMain();
